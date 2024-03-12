@@ -8,7 +8,7 @@ use {
 };
 
 fn get_status_request() -> impl Filter<Extract = (OrderUid,), Error = Rejection> + Clone {
-    warp::path!("v1" / "trades" / OrderUid).and(warp::get())
+    warp::path!("v1" / "status" / OrderUid).and(warp::get())
 }
 
 pub fn get_status(
@@ -18,13 +18,11 @@ pub fn get_status(
         let orderbook = orderbook.clone();
         async move {
             let status = orderbook.get_order_status(&order_uid).await;
-            // Result::<_, Infallible>::Ok(with_status(warp::reply::json(&status),
-            // StatusCode::OK))
 
             Result::<_, Infallible>::Ok(match status {
                 Ok(status) => warp::reply::with_status(warp::reply::json(&status), StatusCode::OK),
                 Err(err) => {
-                    tracing::error!(?err, "get_app_data_by_hash");
+                    tracing::error!(?err, "get_order_status");
                     *Box::new(shared::api::internal_error_reply())
                 }
             })

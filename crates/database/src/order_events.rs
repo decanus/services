@@ -94,7 +94,7 @@ pub async fn delete_order_events_before(
 
 pub async fn get_label(ex: &mut PgConnection, order: &OrderUid) -> Result<OrderEvent, sqlx::Error> {
     const QUERY: &str =
-        r#"SELECT label FROM order_events WHERE order_uid = $1 ORDER BY timestamp DESC LIMIT 1"#;
+        r#"SELECT * FROM order_events WHERE order_uid = $1 ORDER BY timestamp DESC LIMIT 1"#;
     sqlx::query_as(QUERY)
         .bind(ByteArray(order.0))
         .fetch_one(ex)
