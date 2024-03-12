@@ -573,6 +573,7 @@ fn is_buy_order_filled(amount: &BigDecimal, executed_amount: &BigDecimal) -> boo
 }
 
 #[derive(Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Solution {
     pub solver: String,
     pub sell_amount: U256,
@@ -580,6 +581,7 @@ pub struct Solution {
 }
 
 #[derive(Serialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum Status {
     Open,
     Scheduled,
