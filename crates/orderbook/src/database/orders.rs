@@ -581,7 +581,7 @@ pub struct Solution {
 }
 
 #[derive(Serialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", content = "value")]
 pub enum Status {
     Open,
     Scheduled,
