@@ -395,7 +395,7 @@ impl OrderStoring for Postgres {
             OrderEventLabel::Created => Status::Scheduled,
             OrderEventLabel::Considered => Status::Solved(solutions),
             OrderEventLabel::Executing => Status::Executing(solutions),
-            OrderEventLabel::Traded => Status::Traded,
+            OrderEventLabel::Traded => Status::Traded(solutions),
             OrderEventLabel::Cancelled => Status::Cancelled,
             OrderEventLabel::Filtered => Status::Open,
             OrderEventLabel::Invalid => Status::Open,
@@ -586,7 +586,7 @@ pub enum Status {
     Active,
     Solved(Vec<Solution>),
     Executing(Vec<Solution>),
-    Traded,
+    Traded(Vec<Solution>),
     Cancelled,
 }
 
