@@ -1,6 +1,9 @@
 use {
     super::{blockchain::Blockchain, Mempool, Partial, Solver, Test},
-    crate::{domain::competition::order, tests::hex_address},
+    crate::{
+        domain::competition::order,
+        tests::{hex_address, setup::blockchain::Trade},
+    },
     rand::seq::SliceRandom,
     serde_json::json,
     std::{io::Write, net::SocketAddr, path::PathBuf},
@@ -104,17 +107,33 @@ pub fn solve_req(test: &Test) -> serde_json::Value {
             "signature": format!("0x{}", hex::encode(quote.order_signature(&test.blockchain))),
         }));
     }
-    for fulfillment in test.fulfillments.iter() {
-        tokens_json.push(json!({
-            "address": hex_address(test.blockchain.get_token_wrapped(fulfillment.quoted_order.order.sell_token)),
-            "price": "1000000000000000000",
-            "trusted": test.trusted.contains(fulfillment.quoted_order.order.sell_token),
-        }));
-        tokens_json.push(json!({
-            "address": hex_address(test.blockchain.get_token_wrapped(fulfillment.quoted_order.order.buy_token)),
-            "price": "1000000000000000000",
-            "trusted": test.trusted.contains(fulfillment.quoted_order.order.buy_token),
-        }));
+    for trade in test.trades.iter() {
+        match trade {
+            Trade::Fulfillment(fulfillment) => {
+                tokens_json.push(json!({
+                    "address": hex_address(test.blockchain.get_token_wrapped(fulfillment.quoted_order.order.sell_token)),
+                    "price": "1000000000000000000",
+                    "trusted": test.trusted.contains(fulfillment.quoted_order.order.sell_token),
+                }));
+                tokens_json.push(json!({
+                    "address": hex_address(test.blockchain.get_token_wrapped(fulfillment.quoted_order.order.buy_token)),
+                    "price": "1000000000000000000",
+                    "trusted": test.trusted.contains(fulfillment.quoted_order.order.buy_token),
+                }));
+            }
+            Trade::Jit(jit) => {
+                tokens_json.push(json!({
+                    "address": hex_address(test.blockchain.get_token_wrapped(jit.quoted_order.order.sell_token)),
+                    "price": "1000000000000000000",
+                    "trusted": test.trusted.contains(jit.quoted_order.order.sell_token),
+                }));
+                tokens_json.push(json!({
+                    "address": hex_address(test.blockchain.get_token_wrapped(jit.quoted_order.order.buy_token)),
+                    "price": "1000000000000000000",
+                    "trusted": test.trusted.contains(jit.quoted_order.order.buy_token),
+                }));
+            }
+        }
     }
     json!({
         "id": "1",
@@ -227,6 +246,7 @@ async fn create_config_file(
                solving-share-of-deadline = {}
                http-time-buffer = "{}ms"
                fee-handler = {}
+               surplus-capturing-jit-order-owners = {}
                merge-solutions = {}
                "#,
             solver.name,
@@ -241,6 +261,7 @@ async fn create_config_file(
             solver.timeouts.solving_share_of_deadline.get(),
             solver.timeouts.http_delay.num_milliseconds(),
             serde_json::to_string(&solver.fee_handler).unwrap(),
+            serde_json::to_string(&solver.surplus_capturing_jit_order_owners).unwrap(),
             solver.merge_solutions,
         )
         .unwrap();

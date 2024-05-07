@@ -30,6 +30,9 @@ pub struct Blockchain {
     pub trader_address: ethcontract::H160,
     pub trader_secret_key: SecretKey,
 
+    pub surplus_capturing_jit_order_owner_address: Option<ethcontract::H160>,
+    pub surplus_capturing_jit_order_owner_secret_key: Option<SecretKey>,
+
     pub web3: Web3<DynTransport>,
     pub web3_url: String,
     pub tokens: HashMap<&'static str, contracts::ERC20Mintable>,
@@ -87,7 +90,13 @@ impl Pool {
 
 #[derive(Debug, Clone)]
 pub struct Solution {
-    pub fulfillments: Vec<Fulfillment>,
+    pub trades: Vec<Trade>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Trade {
+    Fulfillment(Fulfillment),
+    Jit(Fulfillment),
 }
 
 #[derive(Debug, Clone)]
@@ -131,26 +140,59 @@ impl QuotedOrder {
 
     /// The UID of the order.
     pub fn order_uid(&self, blockchain: &Blockchain) -> tests::boundary::OrderUid {
-        self.boundary(blockchain).uid()
+        self.boundary(
+            blockchain,
+            blockchain.trader_secret_key,
+            blockchain.trader_address,
+        )
+        .uid()
     }
 
     /// The signature of the order.
     pub fn order_signature(&self, blockchain: &Blockchain) -> Vec<u8> {
-        self.boundary(blockchain).signature()
+        self.boundary(
+            blockchain,
+            blockchain.trader_secret_key,
+            blockchain.trader_address,
+        )
+        .signature()
     }
 
-    fn boundary(&self, blockchain: &Blockchain) -> tests::boundary::Order {
+    /// The signature of the order by surplus capturing JIT-order owner
+    pub fn order_signature_by_surplus_capturing_jit_order_owner(
+        &self,
+        blockchain: &Blockchain,
+    ) -> Vec<u8> {
+        self.boundary(
+            blockchain,
+            blockchain
+                .surplus_capturing_jit_order_owner_secret_key
+                .unwrap(),
+            blockchain
+                .surplus_capturing_jit_order_owner_address
+                .unwrap(),
+        )
+        .signature()
+    }
+
+    fn boundary(
+        &self,
+        blockchain: &Blockchain,
+        secret_key: SecretKey,
+        owner: ethcontract::H160,
+    ) -> tests::boundary::Order {
         tests::boundary::Order {
             sell_token: blockchain.get_token(self.order.sell_token),
             buy_token: blockchain.get_token(self.order.buy_token),
             sell_amount: self.sell_amount(),
             buy_amount: self.buy_amount(),
             valid_to: self.order.valid_to,
-            user_fee: 0.into(),
+            receiver: self.order.receiver,
+            user_fee: self.order.fee_amount,
             side: self.order.side,
-            secret_key: blockchain.trader_secret_key,
+            secret_key,
             domain_separator: blockchain.domain_separator,
-            owner: blockchain.trader_address,
+            owner,
             partially_fillable: matches!(self.order.partial, Partial::Yes { .. }),
         }
     }
@@ -160,6 +202,8 @@ pub struct Config {
     pub pools: Vec<Pool>,
     pub trader_address: eth::H160,
     pub trader_secret_key: SecretKey,
+    pub surplus_capturing_jit_order_owner_address: Option<eth::H160>,
+    pub surplus_capturing_jit_order_owner_secret_key: Option<SecretKey>,
     pub solvers: Vec<super::Solver>,
     pub settlement_address: Option<eth::H160>,
     pub rpc_args: Vec<String>,
@@ -184,7 +228,19 @@ impl Blockchain {
             None,
         );
 
-        // Use the primary account to fund the trader and the solver with ETH.
+        let surplus_capturing_jit_order_owner_account = config
+            .surplus_capturing_jit_order_owner_secret_key
+            .map(|surplus_capturing_jit_order_owner_secret_key| {
+                ethcontract::Account::Offline(
+                    ethcontract::PrivateKey::from_slice(
+                        surplus_capturing_jit_order_owner_secret_key.as_ref(),
+                    )
+                    .unwrap(),
+                    None,
+                )
+            });
+
+        // Use the primary account to fund the trader, cow amm and the solver with ETH.
         let balance = web3
             .eth()
             .balance(primary_address(&web3).await, None)
@@ -202,8 +258,23 @@ impl Blockchain {
         )
         .await
         .unwrap();
+        if let Some(surplus_capturing_jit_order_owner_address) =
+            config.surplus_capturing_jit_order_owner_address
+        {
+            wait_for(
+                &web3,
+                web3.eth()
+                    .send_transaction(web3::types::TransactionRequest {
+                        from: primary_address(&web3).await,
+                        to: Some(surplus_capturing_jit_order_owner_address),
+                        value: Some(balance / 5),
+                        ..Default::default()
+                    }),
+            )
+            .await
+            .unwrap();
+        }
 
-        // Deploy WETH and wrap some funds in the primary account of the node.
         let weth = wait_for(
             &web3,
             contracts::WETH9::builder(&web3)
@@ -413,7 +484,39 @@ impl Blockchain {
                 )
                 .await
                 .unwrap();
+                if let Some(surplus_capturing_jit_order_owner_address) =
+                    config.surplus_capturing_jit_order_owner_address
+                {
+                    wait_for(
+                        &web3,
+                        weth.transfer(
+                            surplus_capturing_jit_order_owner_address,
+                            pool.reserve_a.amount,
+                        )
+                        .from(primary_account(&web3).await)
+                        .send(),
+                    )
+                    .await
+                    .unwrap();
+                }
             } else {
+                if let Some(surplus_capturing_jit_order_owner_account) =
+                    surplus_capturing_jit_order_owner_account.clone()
+                {
+                    let vault_relayer = settlement.vault_relayer().call().await.unwrap();
+                    wait_for(
+                        &web3,
+                        tokens
+                            .get(pool.reserve_a.token)
+                            .unwrap()
+                            .approve(vault_relayer, ethcontract::U256::max_value())
+                            .from(surplus_capturing_jit_order_owner_account)
+                            .send(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
                 wait_for(
                     &web3,
                     tokens
@@ -436,6 +539,25 @@ impl Blockchain {
                 )
                 .await
                 .unwrap();
+
+                if let Some(surplus_capturing_jit_order_owner_address) =
+                    config.surplus_capturing_jit_order_owner_address
+                {
+                    wait_for(
+                        &web3,
+                        tokens
+                            .get(pool.reserve_a.token)
+                            .unwrap()
+                            .mint(
+                                surplus_capturing_jit_order_owner_address,
+                                pool.reserve_a.amount,
+                            )
+                            .from(trader_account.clone())
+                            .send(),
+                    )
+                    .await
+                    .unwrap();
+                }
             }
             if pool.reserve_b.token == "WETH" {
                 wait_for(
@@ -454,7 +576,39 @@ impl Blockchain {
                 )
                 .await
                 .unwrap();
+                if let Some(surplus_capturing_jit_order_owner_address) =
+                    config.surplus_capturing_jit_order_owner_address
+                {
+                    wait_for(
+                        &web3,
+                        weth.transfer(
+                            surplus_capturing_jit_order_owner_address,
+                            pool.reserve_b.amount,
+                        )
+                        .from(primary_account(&web3).await)
+                        .send(),
+                    )
+                    .await
+                    .unwrap();
+                }
             } else {
+                if let Some(surplus_capturing_jit_order_owner_account) =
+                    surplus_capturing_jit_order_owner_account.clone()
+                {
+                    let vault_relayer = settlement.vault_relayer().call().await.unwrap();
+                    wait_for(
+                        &web3,
+                        tokens
+                            .get(pool.reserve_b.token)
+                            .unwrap()
+                            .approve(vault_relayer, ethcontract::U256::max_value())
+                            .from(surplus_capturing_jit_order_owner_account)
+                            .send(),
+                    )
+                    .await
+                    .unwrap();
+                }
+
                 wait_for(
                     &web3,
                     tokens
@@ -477,6 +631,24 @@ impl Blockchain {
                 )
                 .await
                 .unwrap();
+                if let Some(surplus_capturing_jit_order_owner_address) =
+                    config.surplus_capturing_jit_order_owner_address
+                {
+                    wait_for(
+                        &web3,
+                        tokens
+                            .get(pool.reserve_b.token)
+                            .unwrap()
+                            .mint(
+                                surplus_capturing_jit_order_owner_address,
+                                pool.reserve_b.amount,
+                            )
+                            .from(trader_account.clone())
+                            .send(),
+                    )
+                    .await
+                    .unwrap();
+                }
             }
             wait_for(
                 &web3,
@@ -506,6 +678,10 @@ impl Blockchain {
         Self {
             trader_address: config.trader_address,
             trader_secret_key: config.trader_secret_key,
+            surplus_capturing_jit_order_owner_address: config
+                .surplus_capturing_jit_order_owner_address,
+            surplus_capturing_jit_order_owner_secret_key: config
+                .surplus_capturing_jit_order_owner_secret_key,
             tokens,
             settlement,
             domain_separator,
@@ -602,11 +778,11 @@ impl Blockchain {
     /// fulfill the orders.
     pub async fn fulfill(
         &self,
-        orders: impl Iterator<Item = &Order>,
+        orders: impl Iterator<Item = &(Order, bool)>,
         solution: &super::Solution,
     ) -> Solution {
         let mut fulfillments = Vec::new();
-        for order in orders {
+        for (order, is_jit_order) in orders {
             // Find the pair to use for this order and calculate the buy and sell amounts.
             let sell_token =
                 contracts::ERC20::at(&self.web3, self.get_token_wrapped(order.sell_token));
@@ -684,46 +860,68 @@ impl Blockchain {
                 .data
                 .unwrap()
                 .0;
-            fulfillments.push(Fulfillment {
-                quoted_order: self.quote(order),
-                execution: execution.clone(),
-                interactions: vec![
-                    Interaction {
-                        address: sell_token.address(),
-                        calldata: match solution.calldata {
-                            super::Calldata::Valid { additional_bytes } => transfer_interaction
-                                .into_iter()
-                                .chain(std::iter::repeat(0xab).take(additional_bytes))
-                                .collect(),
-                            super::Calldata::Invalid => vec![1, 2, 3, 4, 5],
-                        },
-                        inputs: Default::default(),
-                        outputs: Default::default(),
-                        internalize: false,
-                    },
-                    Interaction {
-                        address: pair.contract.address(),
-                        calldata: match solution.calldata {
-                            super::Calldata::Valid { .. } => swap_interaction,
-                            super::Calldata::Invalid => {
-                                vec![10, 11, 12, 13, 14, 15, 63, 78]
-                            }
-                        },
-                        inputs: vec![eth::Asset {
-                            token: sell_token.address().into(),
-                            // Surplus fees stay in the contract.
-                            amount: (execution.sell - order.surplus_fee()).into(),
-                        }],
-                        outputs: vec![eth::Asset {
-                            token: buy_token.address().into(),
-                            amount: execution.buy.into(),
-                        }],
-                        internalize: order.internalize,
-                    },
-                ],
-            });
+            fulfillments.push((
+                Fulfillment {
+                    quoted_order: self.quote(order),
+                    execution: execution.clone(),
+                    interactions: (!is_jit_order)
+                        .then(|| {
+                            vec![
+                                Interaction {
+                                    address: sell_token.address(),
+                                    calldata: match solution.calldata {
+                                        super::Calldata::Valid { additional_bytes } => {
+                                            transfer_interaction
+                                                .into_iter()
+                                                .chain(
+                                                    std::iter::repeat(0xab).take(additional_bytes),
+                                                )
+                                                .collect()
+                                        }
+                                        super::Calldata::Invalid => vec![1, 2, 3, 4, 5],
+                                    },
+                                    inputs: Default::default(),
+                                    outputs: Default::default(),
+                                    internalize: false,
+                                },
+                                Interaction {
+                                    address: pair.contract.address(),
+                                    calldata: match solution.calldata {
+                                        super::Calldata::Valid { .. } => swap_interaction,
+                                        super::Calldata::Invalid => {
+                                            vec![10, 11, 12, 13, 14, 15, 63, 78]
+                                        }
+                                    },
+                                    inputs: vec![eth::Asset {
+                                        token: sell_token.address().into(),
+                                        // Surplus fees stay in the contract.
+                                        amount: (execution.sell - order.surplus_fee()).into(),
+                                    }],
+                                    outputs: vec![eth::Asset {
+                                        token: buy_token.address().into(),
+                                        amount: execution.buy.into(),
+                                    }],
+                                    internalize: order.internalize,
+                                },
+                            ]
+                        })
+                        .unwrap_or_default(),
+                },
+                is_jit_order,
+            ));
         }
-        Solution { fulfillments }
+        Solution {
+            trades: fulfillments
+                .into_iter()
+                .map(|(order, is_jit_order)| {
+                    if *is_jit_order {
+                        Trade::Jit(order)
+                    } else {
+                        Trade::Fulfillment(order)
+                    }
+                })
+                .collect(),
+        }
     }
 
     /// Returns the address of the token with the given symbol.

@@ -1,5 +1,8 @@
 use crate::{
-    domain::{competition::order, eth},
+    domain::{
+        competition::{order, order::Side},
+        eth,
+    },
     infra::config::file::FeeHandler,
     tests::{
         self,
@@ -41,6 +44,35 @@ struct TestCase {
     execution: Execution,
     expected_score: eth::U256,
     fee_handler: FeeHandler,
+    jit_order: Option<Order>,
+    set_surplus_capturing_jit_order_owner_address: bool,
+}
+
+impl Default for TestCase {
+    fn default() -> Self {
+        Self {
+            order: Order {
+                sell_amount: Default::default(),
+                buy_amount: Default::default(),
+                side: Side::Buy,
+            },
+            fee_policy: vec![],
+            execution: Execution {
+                solver: Amounts {
+                    sell: Default::default(),
+                    buy: Default::default(),
+                },
+                driver: Amounts {
+                    sell: Default::default(),
+                    buy: Default::default(),
+                },
+            },
+            expected_score: Default::default(),
+            fee_handler: Default::default(),
+            jit_order: None,
+            set_surplus_capturing_jit_order_owner_address: false,
+        }
+    }
 }
 
 // because of rounding errors, it's good enough to check that the expected value
@@ -78,6 +110,22 @@ async fn protocol_fee_test_case(test_case: TestCase) {
         sell: test_case.execution.driver.sell,
         buy: test_case.execution.driver.buy,
     };
+
+    let jit_order = test_case.jit_order.map(|jit_order| {
+        ab_order()
+            .kind(order::Kind::Limit)
+            .sell_amount(jit_order.sell_amount)
+            .buy_amount(jit_order.buy_amount)
+            .solver_fee(Some(solver_fee))
+            .side(jit_order.side)
+            .fee_policy(test_case.fee_policy.clone())
+            .partial(0.into())
+            .executed(executed)
+            // Surplus is configured explicitly via executed/quoted amounts
+            .no_surplus()
+            .expected_amounts(expected_amounts.clone())
+    });
+
     let order = ab_order()
         .kind(order::Kind::Limit)
         .sell_amount(test_case.order.sell_amount)
@@ -97,9 +145,16 @@ async fn protocol_fee_test_case(test_case: TestCase) {
     let test: Test = tests::setup()
         .name(test_name)
         .pool(pool)
+        .jit_order(jit_order.clone())
         .order(order.clone())
         .solution(ab_solution())
-        .solvers(vec![test_solver().fee_handler(test_case.fee_handler)])
+        .solvers(vec![{
+            let mut solver = test_solver().fee_handler(test_case.fee_handler);
+            if test_case.set_surplus_capturing_jit_order_owner_address {
+                solver = solver.set_surplus_capturing_jit_order_owner();
+            }
+            solver
+        }])
         .done()
         .await;
 
@@ -109,6 +164,87 @@ async fn protocol_fee_test_case(test_case: TestCase) {
         test_case.expected_score
     ));
     result.orders(&[order]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn surplus_protocol_fee_jit_order_from_surplus_capturing_owner_not_capped() {
+    let fee_policy = Policy::Surplus {
+        factor: 0.5,
+        // high enough so we don't get capped by volume fee
+        max_volume_factor: 1.0,
+    };
+    let test_case = TestCase {
+        fee_policy: vec![fee_policy],
+        order: Order {
+            sell_amount: 50.ether().into_wei(),
+            buy_amount: 40.ether().into_wei(),
+            side: order::Side::Buy,
+        },
+        execution: Execution {
+            // 20 ETH surplus in sell token (after network fee), half of which is kept by the
+            // protocol
+            solver: Amounts {
+                sell: 30.ether().into_wei(),
+                buy: 40.ether().into_wei(),
+            },
+            driver: Amounts {
+                sell: 40.ether().into_wei(),
+                buy: 40.ether().into_wei(),
+            },
+        },
+        jit_order: Some(Order {
+            sell_amount: 50.ether().into_wei(),
+            buy_amount: 40.ether().into_wei(),
+            side: order::Side::Buy,
+        }),
+        // Score is 20 x 2 since there are two orders with score 20 (user order + JIT order)
+        expected_score: 40.ether().into_wei(),
+        set_surplus_capturing_jit_order_owner_address: true,
+        ..Default::default()
+    };
+
+    protocol_fee_test_case(test_case).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn surplus_protocol_fee_jit_order_not_capped() {
+    let fee_policy = Policy::Surplus {
+        factor: 0.5,
+        // high enough so we don't get capped by volume fee
+        max_volume_factor: 1.0,
+    };
+    let test_case = TestCase {
+        fee_policy: vec![fee_policy],
+        order: Order {
+            sell_amount: 50.ether().into_wei(),
+            buy_amount: 40.ether().into_wei(),
+            side: order::Side::Buy,
+        },
+        execution: Execution {
+            // 20 ETH surplus in sell token (after network fee), half of which is kept by the
+            // protocol
+            solver: Amounts {
+                sell: 30.ether().into_wei(),
+                buy: 40.ether().into_wei(),
+            },
+            driver: Amounts {
+                sell: 40.ether().into_wei(),
+                buy: 40.ether().into_wei(),
+            },
+        },
+        jit_order: Some(Order {
+            sell_amount: 50.ether().into_wei(),
+            buy_amount: 40.ether().into_wei(),
+            side: order::Side::Buy,
+        }),
+        // Score is 20 since the JIT order is not from a surplus capturing owner
+        expected_score: 20.ether().into_wei(),
+        ..Default::default()
+    };
+
+    protocol_fee_test_case(test_case).await;
 }
 
 #[tokio::test]
@@ -154,7 +290,7 @@ async fn triple_surplus_protocol_fee_buy_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
 
     protocol_fee_test_case(test_case).await;
@@ -198,7 +334,7 @@ async fn triple_surplus_protocol_fee_sell_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -239,7 +375,7 @@ async fn surplus_and_volume_protocol_fee_buy_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -293,6 +429,7 @@ async fn surplus_and_price_improvement_protocol_fee_sell_order_not_capped() {
         },
         expected_score: 20.ether().into_wei(),
         fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -341,7 +478,7 @@ async fn surplus_and_price_improvement_fee_buy_in_market_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -374,7 +511,7 @@ async fn surplus_protocol_fee_buy_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
 
     protocol_fee_test_case(test_case).await;
@@ -406,6 +543,7 @@ async fn protocol_fee_calculated_on_the_solver_side() {
         },
         expected_score: 35.ether().into_wei(),
         fee_handler: FeeHandler::Solver,
+        ..Default::default()
     };
 
     protocol_fee_test_case(test_case).await;
@@ -438,7 +576,7 @@ async fn surplus_protocol_fee_sell_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -471,7 +609,7 @@ async fn surplus_protocol_fee_partial_buy_order_not_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
 
     protocol_fee_test_case(test_case).await;
@@ -504,7 +642,7 @@ async fn surplus_protocol_fee_partial_sell_order_not_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -536,7 +674,7 @@ async fn surplus_protocol_fee_buy_order_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -568,7 +706,7 @@ async fn surplus_protocol_fee_sell_order_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -600,7 +738,7 @@ async fn surplus_protocol_fee_partial_buy_order_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -632,7 +770,7 @@ async fn surplus_protocol_fee_partial_sell_order_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -660,7 +798,7 @@ async fn volume_protocol_fee_buy_order() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -690,7 +828,7 @@ async fn volume_protocol_fee_buy_order_at_limit_price() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -718,7 +856,7 @@ async fn volume_protocol_fee_sell_order() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -748,7 +886,7 @@ async fn volume_protocol_fee_sell_order_at_limit_price() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -776,7 +914,7 @@ async fn volume_protocol_fee_partial_buy_order() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -807,7 +945,7 @@ async fn volume_protocol_fee_partial_buy_order_at_limit_price() {
             },
         },
         expected_score: 4.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -835,7 +973,7 @@ async fn volume_protocol_fee_partial_sell_order() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -866,7 +1004,7 @@ async fn volume_protocol_fee_partial_sell_order_at_limit_price() {
             },
         },
         expected_score: 5.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -904,7 +1042,7 @@ async fn price_improvement_fee_buy_in_market_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -942,7 +1080,7 @@ async fn price_improvement_fee_sell_in_market_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -980,7 +1118,7 @@ async fn price_improvement_fee_buy_out_of_market_order_not_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1018,7 +1156,7 @@ async fn price_improvement_fee_sell_out_of_market_order_not_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1056,7 +1194,7 @@ async fn price_improvement_fee_buy_in_market_order_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1094,7 +1232,7 @@ async fn price_improvement_fee_sell_in_market_order_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1132,7 +1270,7 @@ async fn price_improvement_fee_buy_out_of_market_order_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1170,7 +1308,7 @@ async fn price_improvement_fee_sell_out_of_market_order_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1208,7 +1346,7 @@ async fn price_improvement_fee_partial_buy_in_market_order_not_capped() {
             },
         },
         expected_score: 15.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1248,7 +1386,7 @@ async fn price_improvement_fee_partial_sell_in_market_order_not_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1286,7 +1424,7 @@ async fn price_improvement_fee_partial_buy_out_of_market_order_not_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1324,7 +1462,7 @@ async fn price_improvement_fee_partial_sell_out_of_market_order_not_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1362,7 +1500,7 @@ async fn price_improvement_fee_partial_buy_in_market_order_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1400,7 +1538,7 @@ async fn price_improvement_fee_partial_sell_in_market_order_capped() {
             },
         },
         expected_score: 20.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1438,7 +1576,7 @@ async fn price_improvement_fee_partial_buy_out_of_market_order_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1476,7 +1614,7 @@ async fn price_improvement_fee_partial_sell_out_of_market_order_capped() {
             },
         },
         expected_score: 10.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
@@ -1514,7 +1652,7 @@ async fn price_improvement_fee_sell_no_improvement() {
             },
         },
         expected_score: 5.ether().into_wei(),
-        fee_handler: FeeHandler::Driver,
+        ..Default::default()
     };
     protocol_fee_test_case(test_case).await;
 }
