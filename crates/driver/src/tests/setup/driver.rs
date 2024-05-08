@@ -140,6 +140,7 @@ pub fn solve_req(test: &Test) -> serde_json::Value {
         "tokens": tokens_json,
         "orders": orders_json,
         "deadline": test.deadline,
+        "surplusCapturingJitOrderOwners": test.surplus_capturing_jit_order_owners,
     })
 }
 
@@ -246,7 +247,6 @@ async fn create_config_file(
                solving-share-of-deadline = {}
                http-time-buffer = "{}ms"
                fee-handler = {}
-               surplus-capturing-jit-order-owners = {}
                merge-solutions = {}
                "#,
             solver.name,
@@ -261,7 +261,6 @@ async fn create_config_file(
             solver.timeouts.solving_share_of_deadline.get(),
             solver.timeouts.http_delay.num_milliseconds(),
             serde_json::to_string(&solver.fee_handler).unwrap(),
-            serde_json::to_string(&solver.surplus_capturing_jit_order_owners).unwrap(),
             solver.merge_solutions,
         )
         .unwrap();

@@ -311,8 +311,6 @@ pub struct Solver {
     timeouts: infra::solver::Timeouts,
     /// Determines whether the `solver` or the `driver` handles the fees
     fee_handler: FeeHandler,
-    /// List of surplus capturing JIT-order owners
-    surplus_capturing_jit_order_owners: Vec<H160>,
     /// Whether or not solver is allowed to combine multiple solutions into a
     /// new one.
     merge_solutions: bool,
@@ -342,7 +340,6 @@ pub fn test_solver() -> Solver {
             solving_share_of_deadline: default_solving_share_of_deadline().try_into().unwrap(),
         },
         fee_handler: FeeHandler::default(),
-        surplus_capturing_jit_order_owners: vec![],
         merge_solutions: false,
     }
 }
@@ -375,11 +372,6 @@ impl Solver {
 
     pub fn fee_handler(mut self, fee_handler: FeeHandler) -> Self {
         self.fee_handler = fee_handler;
-        self
-    }
-
-    pub fn set_surplus_capturing_jit_order_owner(mut self) -> Self {
-        self.surplus_capturing_jit_order_owners = vec![self.private_key.public_address()];
         self
     }
 
@@ -490,6 +482,7 @@ pub fn setup() -> Setup {
         mempools: vec![Mempool::Public],
         rpc_args: vec!["--gas-limit".into(), "10000000".into()],
         jit_order: None,
+        surplus_capturing_jit_order_owners: Default::default(),
     }
 }
 
@@ -515,6 +508,8 @@ pub struct Setup {
     rpc_args: Vec<String>,
     /// Whether the solver sends the solution as a JIT order
     jit_order: Option<Order>,
+    /// List of surplus capturing JIT-order owners
+    surplus_capturing_jit_order_owners: Vec<H160>,
 }
 
 /// The validity of a solution.
@@ -770,6 +765,20 @@ impl Setup {
         self
     }
 
+    pub fn set_surplus_capturing_jit_order_owner(
+        mut self,
+        set_surplus_capturing_jit_order_owner: bool,
+    ) -> Self {
+        if set_surplus_capturing_jit_order_owner {
+            self.surplus_capturing_jit_order_owners = self
+                .solvers
+                .iter()
+                .map(|solver| solver.private_key.public_address())
+                .collect();
+        }
+        self
+    }
+
     /// Create the test: set up onchain contracts and pools, start a mock HTTP
     /// server for the solver and start the HTTP server for the driver.
     pub async fn done(self) -> Test {
@@ -788,6 +797,7 @@ impl Setup {
             trusted,
             config_file,
             jit_order,
+            surplus_capturing_jit_order_owners,
             ..
         } = self;
 
@@ -805,7 +815,7 @@ impl Setup {
         ) = jit_order
             .as_ref()
             .map(|_| {
-                // Set the CoW AMM as the first solver
+                // Set the surplus capturing jit-order owner as the first solver
                 (
                     Some(
                         self.solvers
@@ -891,6 +901,7 @@ impl Setup {
             deadline,
             quoted_orders: quotes,
             quote: self.quote,
+            surplus_capturing_jit_order_owners,
         }
     }
 
@@ -923,6 +934,8 @@ pub struct Test {
     deadline: chrono::DateTime<chrono::Utc>,
     /// Is this testing the /quote endpoint?
     quote: bool,
+    /// List of surplus capturing JIT-order owners
+    surplus_capturing_jit_order_owners: Vec<H160>,
 }
 
 impl Test {

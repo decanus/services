@@ -148,13 +148,10 @@ async fn protocol_fee_test_case(test_case: TestCase) {
         .jit_order(jit_order.clone())
         .order(order.clone())
         .solution(ab_solution())
-        .solvers(vec![{
-            let mut solver = test_solver().fee_handler(test_case.fee_handler);
-            if test_case.set_surplus_capturing_jit_order_owner_address {
-                solver = solver.set_surplus_capturing_jit_order_owner();
-            }
-            solver
-        }])
+        .set_surplus_capturing_jit_order_owner(
+            test_case.set_surplus_capturing_jit_order_owner_address,
+        )
+        .solvers(vec![test_solver().fee_handler(test_case.fee_handler)])
         .done()
         .await;
 
