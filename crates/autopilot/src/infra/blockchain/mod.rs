@@ -12,6 +12,7 @@ use {
     url::Url,
 };
 
+pub mod circuit_breaker;
 pub mod contracts;
 pub mod dto;
 
@@ -63,6 +64,11 @@ impl Rpc {
     pub fn web3(&self) -> &DynWeb3 {
         &self.web3
     }
+
+    /// Returns a reference to the underlying RPC URL.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
 }
 
 /// The Ethereum blockchain.
@@ -81,8 +87,13 @@ impl Ethereum {
     ///
     /// Since this type is essential for the program this method will panic on
     /// any initialization error.
-    pub async fn new(rpc: Rpc, addresses: contracts::Addresses, poll_interval: Duration) -> Self {
-        let Rpc { web3, chain, url } = rpc;
+    pub async fn new(
+        web3: DynWeb3,
+        chain: ChainId,
+        url: Url,
+        addresses: contracts::Addresses,
+        poll_interval: Duration,
+    ) -> Self {
         let contracts = Contracts::new(&web3, &chain, addresses).await;
 
         Self {
