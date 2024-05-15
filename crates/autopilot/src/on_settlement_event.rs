@@ -34,17 +34,17 @@ use {
             Postgres,
         },
         decoded_settlement::DecodedSettlement,
-        domain::settlement::Transaction,
+        domain::{eth, settlement::Transaction},
         infra,
     },
     anyhow::{Context, Result},
     async_trait::async_trait,
-    database::{settlements::SettlementEvent, PgTransaction},
+    database::PgTransaction,
     primitive_types::H256,
     shared::external_prices::ExternalPrices,
-    sqlx::{Acquire, PgConnection},
+    sqlx::PgConnection,
     std::{collections::BTreeMap, sync::Arc},
-    tokio::sync::Notify,
+    tokio::sync::{Mutex, Notify},
 };
 
 pub struct OnSettlementEvent {
@@ -52,8 +52,6 @@ pub struct OnSettlementEvent {
 }
 
 struct Inner {
-    eth: infra::Ethereum,
-    db: Postgres,
     notify: Notify,
 }
 
@@ -68,26 +66,26 @@ enum AuctionIdRecoveryStatus {
 
 #[async_trait]
 pub trait OnSettlementEventAction: Send + Sync {
-    async fn apply(
-        &self,
-        ex: PgTransaction<'_>,
-        event: SettlementEvent,
-        hash: H256,
-        transaction: Transaction,
-    ) -> Result<bool>;
+    async fn apply(&self) -> Result<bool>;
 }
 
 pub struct Updater {
     eth: infra::Ethereum,
     persistence: infra::Persistence,
+    db: Postgres,
 }
 
 impl Updater {
-    pub fn new(
+    pub fn build(
         eth: infra::Ethereum,
         persistence: infra::Persistence,
+        db: Postgres,
     ) -> Arc<dyn OnSettlementEventAction> {
-        Arc::new(Self { eth, persistence })
+        Arc::new(Self {
+            eth,
+            persistence,
+            db,
+        })
     }
 
     async fn fetch_auction_data(
@@ -221,14 +219,29 @@ impl Updater {
 
 #[async_trait]
 impl OnSettlementEventAction for Updater {
-    async fn apply(
-        &self,
-        mut ex: PgTransaction<'_>,
-        event: SettlementEvent,
-        hash: H256,
-        transaction: Transaction,
-    ) -> Result<bool> {
-        let mut ex = ex.begin().await.unwrap();
+    async fn apply(&self) -> Result<bool> {
+        let mut ex = self
+            .db
+            .pool
+            .begin()
+            .await
+            .context("acquire DB connection")?;
+        let event = match database::settlements::get_settlement_without_auction(&mut ex)
+            .await
+            .context("get_settlement_without_auction")?
+        {
+            Some(event) => event,
+            None => return Ok(false),
+        };
+
+        let hash = H256(event.tx_hash.0);
+        tracing::debug!("updating settlement details for tx {hash:?}");
+
+        let Ok(transaction) = self.eth.transaction(hash.into()).await else {
+            tracing::warn!(?hash, "no tx found");
+            return Ok(false);
+        };
+
         let (auction_id, auction_data) =
             match Self::recover_auction_id_from_calldata(&mut ex, &transaction).await? {
                 AuctionIdRecoveryStatus::InvalidCalldata => {
@@ -263,12 +276,92 @@ impl OnSettlementEventAction for Updater {
     }
 }
 
+#[allow(dead_code)]
+pub struct CircuitBreaker {
+    eth: infra::blockchain::circuit_breaker::CircuitBreaker,
+    persistence: infra::Persistence,
+    db: Postgres,
+    solvers: Vec<eth::Address>,
+    // Registry to keep track of the already processed settlements, format (block, hash)
+    registry: Arc<Mutex<BTreeMap<i64, H256>>>,
+}
+
+impl CircuitBreaker {
+    /// Maximum capacity of the registry in order not to overflow the memory
+    const MAX_REGISTRY_SIZE: usize = 100;
+    /// The number of settlements taken from the database (ordered by block)
+    const NUMBER_SETTLEMENTS: i64 = 4;
+
+    pub fn build(
+        eth: infra::blockchain::circuit_breaker::CircuitBreaker,
+        persistence: infra::Persistence,
+        solvers: Vec<eth::Address>,
+        db: Postgres,
+    ) -> Arc<dyn OnSettlementEventAction> {
+        Arc::new(Self {
+            eth,
+            persistence,
+            db,
+            solvers,
+            registry: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+}
+
+#[async_trait]
+impl OnSettlementEventAction for CircuitBreaker {
+    async fn apply(&self) -> Result<bool> {
+        let mut ex = self
+            .db
+            .pool
+            .begin()
+            .await
+            .context("acquire DB connection")?;
+        let mut events = database::settlements::get_settlements_without_auction(
+            &mut ex,
+            Self::NUMBER_SETTLEMENTS,
+        )
+        .await
+        .context("get_settlement_without_auction")?
+        .into_iter()
+        .map(|event| (event.block_number, H256(event.tx_hash.0)))
+        .collect::<BTreeMap<_, _>>();
+
+        {
+            let mut registry = self.registry.lock().await;
+
+            let new_events = events
+                .iter()
+                .filter(|&(k, _)| !registry.contains_key(k))
+                .map(|(&k, &v)| (k, v))
+                .collect::<BTreeMap<_, _>>();
+
+            if new_events.is_empty() {
+                return Ok(false);
+            }
+
+            // @TODO: Write here the check for the settlement validity
+
+            // We want to keep the registry with a max size of MAX_REGISTRY_SIZE, since the
+            // BTreeMap is ordered by key, every time there is a buffer
+            // overflow, the oldest blocks are removed This way we always
+            // preserve the most up-to-date data in-memory
+            registry.append(&mut events);
+            (registry.len() > Self::MAX_REGISTRY_SIZE).then(|| {
+                (0..(registry.len() - Self::MAX_REGISTRY_SIZE)).for_each(|_| {
+                    registry.pop_first();
+                })
+            });
+        }
+
+        Ok(true)
+    }
+}
+
 impl OnSettlementEvent {
     /// Creates a new OnSettlementEventUpdater
-    pub fn new(eth: infra::Ethereum, db: Postgres) -> Self {
+    pub fn new() -> Self {
         let inner = Arc::new(Inner {
-            eth,
-            db,
             notify: Notify::new(),
         });
         Self { inner }
@@ -305,6 +398,12 @@ impl OnSettlementEvent {
     }
 }
 
+impl Default for OnSettlementEvent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Inner {
     async fn listen_for_updates(
         self: Arc<Inner>,
@@ -335,30 +434,6 @@ impl Inner {
         &self,
         on_settlement_event_action: Arc<dyn OnSettlementEventAction>,
     ) -> Result<bool> {
-        let mut ex = self
-            .db
-            .pool
-            .begin()
-            .await
-            .context("acquire DB connection")?;
-        let event = match database::settlements::get_settlement_without_auction(&mut ex)
-            .await
-            .context("get_settlement_without_auction")?
-        {
-            Some(event) => event,
-            None => return Ok(false),
-        };
-
-        let hash = H256(event.tx_hash.0);
-        tracing::debug!("updating settlement details for tx {hash:?}");
-
-        let Ok(transaction) = self.eth.transaction(hash.into()).await else {
-            tracing::warn!(?hash, "no tx found");
-            return Ok(false);
-        };
-
-        on_settlement_event_action
-            .apply(ex, event, hash, transaction)
-            .await
+        on_settlement_event_action.apply().await
     }
 }

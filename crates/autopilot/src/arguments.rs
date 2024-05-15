@@ -2,7 +2,7 @@ use {
     crate::{domain::fee::FeeFactor, infra},
     anyhow::Context,
     clap::ValueEnum,
-    primitive_types::H160,
+    primitive_types::{H160, H256},
     shared::{
         arguments::{display_list, display_option, ExternalSolver},
         bad_token::token_owner_finder,
@@ -229,6 +229,11 @@ pub struct Arguments {
     /// `order_events` database table.
     #[clap(long, env, default_value = "30d", value_parser = humantime::parse_duration)]
     pub order_events_cleanup_threshold: Duration,
+
+    /// Describes the circuit breaker configuration if the configuration is
+    /// present
+    #[clap(long, env)]
+    pub circuit_breaker: Option<CircuitBreaker>,
 }
 
 impl std::fmt::Display for Arguments {
@@ -273,6 +278,7 @@ impl std::fmt::Display for Arguments {
             max_settlement_transaction_wait,
             s3,
             protocol_fee_exempt_addresses,
+            circuit_breaker,
         } = self;
 
         write!(f, "{}", shared)?;
@@ -359,6 +365,7 @@ impl std::fmt::Display for Arguments {
             max_settlement_transaction_wait
         )?;
         writeln!(f, "s3: {:?}", s3)?;
+        writeln!(f, "circuit breaker: {:?}", circuit_breaker)?;
         Ok(())
     }
 }
@@ -479,9 +486,37 @@ impl FromStr for FeePolicy {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CircuitBreaker {
+    pub authenticator_eoa: H256,
+    pub solvers: Vec<H160>,
+}
+
+impl FromStr for CircuitBreaker {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.split(':');
+        let authenticator_eoa = H256::from_str(parts.next().context("missing authenticator eoa")?)
+            .expect("invalid authenticator eoa");
+        let solvers = parts
+            .next()
+            .context("missing solvers")?
+            .split(',')
+            .map(H160::from_str)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("invalid solver");
+
+        Ok(CircuitBreaker {
+            authenticator_eoa,
+            solvers,
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::*;
+    use {super::*, hex::ToHex};
 
     #[test]
     fn test_fee_factor_limits() {
@@ -505,5 +540,35 @@ mod test {
                 .to_string()
                 .contains("Factor must be in the range [0, 1)"),)
         }
+    }
+
+    #[test]
+    fn test_circuit_breaker() {
+        let authenticator_eoa = "1a2b3c4d5e6f70819293a4b5c6d7e8f909f1e2d3c4b5a6978877665544332211";
+        let solvers_a = "abcdef1234567890abcdef1234567890abcdef12";
+        let solvers_b = "1234567890abcdef1234567890abcdef12345678";
+        let circuit_breaker_str = format!("{authenticator_eoa}:{solvers_a},{solvers_b}");
+
+        let circuit_breaker = CircuitBreaker::from_str(&circuit_breaker_str).unwrap();
+
+        assert_eq!(
+            circuit_breaker
+                .authenticator_eoa
+                .encode_hex::<String>()
+                .as_str(),
+            authenticator_eoa
+        );
+        assert_eq!(circuit_breaker.solvers.len(), 2);
+        assert!(circuit_breaker
+            .solvers
+            .clone()
+            .into_iter()
+            .map(|solver| solver.encode_hex::<String>())
+            .any(|solver| solver.as_str() == solvers_a),);
+        assert!(circuit_breaker
+            .solvers
+            .into_iter()
+            .map(|solver| solver.encode_hex::<String>())
+            .any(|solver| solver.as_str() == solvers_b),);
     }
 }

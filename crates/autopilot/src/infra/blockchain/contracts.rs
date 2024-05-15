@@ -16,7 +16,6 @@ pub struct Contracts {
 pub struct Addresses {
     pub settlement: Option<H160>,
     pub weth: Option<H160>,
-    pub authenticator_eoa: Option<ethcontract::Account>,
 }
 
 impl Contracts {

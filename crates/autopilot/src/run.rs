@@ -171,7 +171,6 @@ pub async fn run(args: Arguments) {
     let contracts = infra::blockchain::contracts::Addresses {
         settlement: args.shared.settlement_contract_address,
         weth: args.shared.native_token_address,
-        authenticator_eoa: None,
     };
     let eth = ethereum(
         web3.clone(),
@@ -179,14 +178,6 @@ pub async fn run(args: Arguments) {
         url,
         contracts.clone(),
         args.shared.current_block.block_stream_poll_interval,
-    )
-    .await;
-
-    CircuitBreaker::new(
-        web3.clone(),
-        chain,
-        eth.contracts().settlement().clone(),
-        contracts,
     )
     .await;
 
@@ -467,10 +458,40 @@ pub async fn run(args: Arguments) {
 
     let persistence =
         infra::persistence::Persistence::new(args.s3.into().unwrap(), Arc::new(db.clone())).await;
-    let updater = crate::on_settlement_event::Updater::new(eth.clone(), persistence.clone());
-    let on_settlement_event =
-        crate::on_settlement_event::OnSettlementEvent::new(eth.clone(), db.clone())
-            .add_listener(updater);
+    let updater =
+        crate::on_settlement_event::Updater::build(eth.clone(), persistence.clone(), db.clone());
+
+    let mut on_settlement_event =
+        crate::on_settlement_event::OnSettlementEvent::new().add_listener(updater);
+
+    // Add a circuit breaker listener if configured
+    if let Some(circuit_breaker_args) = args.circuit_breaker {
+        let authenticator_eao = ethcontract::Account::Offline(
+            ethcontract::PrivateKey::from_raw(circuit_breaker_args.authenticator_eoa.0).unwrap(),
+            None,
+        );
+        let circuit_breaker = CircuitBreaker::new(
+            web3.clone(),
+            chain,
+            eth.contracts().settlement().clone(),
+            authenticator_eao,
+        )
+        .await;
+
+        let circuit_breaker = crate::on_settlement_event::CircuitBreaker::build(
+            circuit_breaker,
+            persistence.clone(),
+            circuit_breaker_args
+                .solvers
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            db.clone(),
+        );
+
+        on_settlement_event = on_settlement_event.add_listener(circuit_breaker);
+    }
+
     let event_updater = Arc::new(EventUpdater::new(
         boundary::events::settlement::GPv2SettlementContract::new(
             eth.contracts().settlement().clone(),

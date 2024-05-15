@@ -1,10 +1,7 @@
 use {
     crate::{
         domain,
-        infra::blockchain::{
-            contracts::{deployment_address, Addresses},
-            ChainId,
-        },
+        infra::blockchain::{contracts::deployment_address, ChainId},
     },
     ethcontract::{dyns::DynWeb3, transaction::TransactionResult},
 };
@@ -17,7 +14,7 @@ pub struct CircuitBreaker {
     /// The safe module that is used to provide special role to EOA.
     authenticator_role: contracts::Roles,
     /// The EOA that is allowed to add/remove solvers.
-    authenticator_eoa: Option<ethcontract::Account>,
+    authenticator_eoa: ethcontract::Account,
 }
 
 impl CircuitBreaker {
@@ -27,7 +24,7 @@ impl CircuitBreaker {
         web3: DynWeb3,
         chain: ChainId,
         settlement: contracts::GPv2Settlement,
-        addresses: Addresses,
+        authenticator_eoa: ethcontract::Account,
     ) -> Self {
         let authenticator = contracts::GPv2AllowListAuthentication::at(
             &web3,
@@ -46,7 +43,7 @@ impl CircuitBreaker {
         Self {
             authenticator,
             authenticator_role,
-            authenticator_eoa: addresses.authenticator_eoa,
+            authenticator_eoa,
         }
     }
 
@@ -73,11 +70,7 @@ impl CircuitBreaker {
                 ethcontract::Bytes([0; 32]), // @TODO: populate role
                 true,
             )
-            .from(
-                self.authenticator_eoa
-                    .clone()
-                    .ok_or(Error::SolverRemovalNotEnabled)?,
-            )
+            .from(self.authenticator_eoa.clone())
             .send()
             .await
             .map_err(Error::SolverRemovalFailed)
@@ -90,6 +83,4 @@ pub enum Error {
     SolverRemovalBadCalldata,
     #[error("failed to remove solver {0}")]
     SolverRemovalFailed(#[from] ethcontract::errors::MethodError),
-    #[error("solver removal has not been enabled")]
-    SolverRemovalNotEnabled,
 }
