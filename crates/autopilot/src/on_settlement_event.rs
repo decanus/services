@@ -38,21 +38,21 @@ use {
         infra,
     },
     anyhow::{Context, Result},
-    database::PgTransaction,
+    async_trait::async_trait,
+    database::{settlements::SettlementEvent, PgTransaction},
     primitive_types::H256,
     shared::external_prices::ExternalPrices,
-    sqlx::PgConnection,
+    sqlx::{Acquire, PgConnection},
     std::{collections::BTreeMap, sync::Arc},
     tokio::sync::Notify,
 };
 
-pub struct OnSettlementEventUpdater {
+pub struct OnSettlementEvent {
     inner: Arc<Inner>,
 }
 
 struct Inner {
     eth: infra::Ethereum,
-    persistence: infra::Persistence,
     db: Postgres,
     notify: Notify,
 }
@@ -66,116 +66,28 @@ enum AuctionIdRecoveryStatus {
     InvalidCalldata,
 }
 
-impl OnSettlementEventUpdater {
-    /// Creates a new OnSettlementEventUpdater and asynchronously schedules the
-    /// first update run.
-    pub fn new(eth: infra::Ethereum, db: Postgres, persistence: infra::Persistence) -> Self {
-        let inner = Arc::new(Inner {
-            eth,
-            persistence,
-            db,
-            notify: Notify::new(),
-        });
-        let inner_clone = inner.clone();
-        tokio::spawn(async move { Inner::listen_for_updates(inner_clone).await });
-        Self { inner }
-    }
-
-    /// Deletes settlement_observations and order executions for the given range
-    pub async fn delete_observations(
-        transaction: &mut PgTransaction<'_>,
-        from_block: u64,
-    ) -> Result<()> {
-        database::settlements::delete(transaction, from_block)
-            .await
-            .context("delete_settlement_observations")?;
-
-        Ok(())
-    }
-
-    /// Schedules an update loop on a background thread
-    pub fn schedule_update(&self) {
-        self.inner.notify.notify_one();
-    }
+#[async_trait]
+pub trait OnSettlementEventAction: Send + Sync {
+    async fn apply(
+        &self,
+        ex: PgTransaction<'_>,
+        event: SettlementEvent,
+        hash: H256,
+        transaction: Transaction,
+    ) -> Result<bool>;
 }
 
-impl Inner {
-    async fn listen_for_updates(self: Arc<Inner>) -> ! {
-        loop {
-            match self.update().await {
-                Ok(true) => {
-                    tracing::debug!("on settlement event updater ran and processed event");
-                    // There might be more pending updates, continue immediately.
-                    continue;
-                }
-                Ok(false) => {
-                    tracing::debug!("on settlement event updater ran without update");
-                }
-                Err(err) => {
-                    tracing::error!(?err, "on settlement event update task failed");
-                }
-            }
-            self.notify.notified().await;
-        }
-    }
+pub struct Updater {
+    eth: infra::Ethereum,
+    persistence: infra::Persistence,
+}
 
-    /// Update database for settlement events that have not been processed yet.
-    ///
-    /// Returns whether an update was performed.
-    async fn update(&self) -> Result<bool> {
-        let mut ex = self
-            .db
-            .pool
-            .begin()
-            .await
-            .context("acquire DB connection")?;
-        let event = match database::settlements::get_settlement_without_auction(&mut ex)
-            .await
-            .context("get_settlement_without_auction")?
-        {
-            Some(event) => event,
-            None => return Ok(false),
-        };
-
-        let hash = H256(event.tx_hash.0);
-        tracing::debug!("updating settlement details for tx {hash:?}");
-
-        let Ok(transaction) = self.eth.transaction(hash.into()).await else {
-            tracing::warn!(?hash, "no tx found");
-            return Ok(false);
-        };
-
-        let (auction_id, auction_data) =
-            match Self::recover_auction_id_from_calldata(&mut ex, &transaction).await? {
-                AuctionIdRecoveryStatus::InvalidCalldata => {
-                    // To not get stuck on indexing the same transaction over and over again, we
-                    // insert the default auction ID (0)
-                    (Default::default(), None)
-                }
-                AuctionIdRecoveryStatus::DoNotAddAuctionData(auction_id) => (auction_id, None),
-                AuctionIdRecoveryStatus::AddAuctionData(auction_id, settlement) => (
-                    auction_id,
-                    Some(
-                        self.fetch_auction_data(hash, settlement, auction_id)
-                            .await?,
-                    ),
-                ),
-            };
-
-        let update = SettlementUpdate {
-            block_number: event.block_number,
-            log_index: event.log_index,
-            auction_id,
-            auction_data,
-        };
-
-        tracing::debug!(?hash, ?update, "updating settlement details for tx");
-
-        Postgres::update_settlement_details(&mut ex, update.clone())
-            .await
-            .with_context(|| format!("insert_settlement_details: {update:?}"))?;
-        ex.commit().await?;
-        Ok(true)
+impl Updater {
+    pub fn new(
+        eth: infra::Ethereum,
+        persistence: infra::Persistence,
+    ) -> Arc<dyn OnSettlementEventAction> {
+        Arc::new(Self { eth, persistence })
     }
 
     async fn fetch_auction_data(
@@ -304,5 +216,149 @@ impl Inner {
                 auction_id, settlement,
             )),
         }
+    }
+}
+
+#[async_trait]
+impl OnSettlementEventAction for Updater {
+    async fn apply(
+        &self,
+        mut ex: PgTransaction<'_>,
+        event: SettlementEvent,
+        hash: H256,
+        transaction: Transaction,
+    ) -> Result<bool> {
+        let mut ex = ex.begin().await.unwrap();
+        let (auction_id, auction_data) =
+            match Self::recover_auction_id_from_calldata(&mut ex, &transaction).await? {
+                AuctionIdRecoveryStatus::InvalidCalldata => {
+                    // To not get stuck on indexing the same transaction over and over again, we
+                    // insert the default auction ID (0)
+                    (Default::default(), None)
+                }
+                AuctionIdRecoveryStatus::DoNotAddAuctionData(auction_id) => (auction_id, None),
+                AuctionIdRecoveryStatus::AddAuctionData(auction_id, settlement) => (
+                    auction_id,
+                    Some(
+                        self.fetch_auction_data(hash, settlement, auction_id)
+                            .await?,
+                    ),
+                ),
+            };
+
+        let update = SettlementUpdate {
+            block_number: event.block_number,
+            log_index: event.log_index,
+            auction_id,
+            auction_data,
+        };
+
+        tracing::debug!(?hash, ?update, "updating settlement details for tx");
+
+        Postgres::update_settlement_details(&mut ex, update.clone())
+            .await
+            .with_context(|| format!("insert_settlement_details: {update:?}"))?;
+        ex.commit().await?;
+        Ok(true)
+    }
+}
+
+impl OnSettlementEvent {
+    /// Creates a new OnSettlementEventUpdater
+    pub fn new(eth: infra::Ethereum, db: Postgres) -> Self {
+        let inner = Arc::new(Inner {
+            eth,
+            db,
+            notify: Notify::new(),
+        });
+        Self { inner }
+    }
+
+    /// Asynchronously schedules the first update run.
+    pub fn add_listener(
+        self,
+        on_settlement_event_action: Arc<dyn OnSettlementEventAction>,
+    ) -> Self {
+        let inner_clone = self.inner.clone();
+        let on_settlement_event_action_clone = on_settlement_event_action.clone();
+        tokio::spawn(async move {
+            Inner::listen_for_updates(inner_clone, on_settlement_event_action_clone).await
+        });
+        Self { inner: self.inner }
+    }
+
+    /// Deletes settlement_observations and order executions for the given range
+    pub async fn delete_observations(
+        transaction: &mut PgTransaction<'_>,
+        from_block: u64,
+    ) -> Result<()> {
+        database::settlements::delete(transaction, from_block)
+            .await
+            .context("delete_settlement_observations")?;
+
+        Ok(())
+    }
+
+    /// Schedules an update loop on a background thread
+    pub fn schedule_update(&self) {
+        self.inner.notify.notify_one();
+    }
+}
+
+impl Inner {
+    async fn listen_for_updates(
+        self: Arc<Inner>,
+        on_settlement_event_action: Arc<dyn OnSettlementEventAction>,
+    ) -> ! {
+        loop {
+            match self.update(on_settlement_event_action.clone()).await {
+                Ok(true) => {
+                    tracing::debug!("on settlement event updater ran and processed event");
+                    // There might be more pending updates, continue immediately.
+                    continue;
+                }
+                Ok(false) => {
+                    tracing::debug!("on settlement event updater ran without update");
+                }
+                Err(err) => {
+                    tracing::error!(?err, "on settlement event update task failed");
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+
+    /// Update database for settlement events that have not been processed yet.
+    ///
+    /// Returns whether an update was performed.
+    async fn update(
+        &self,
+        on_settlement_event_action: Arc<dyn OnSettlementEventAction>,
+    ) -> Result<bool> {
+        let mut ex = self
+            .db
+            .pool
+            .begin()
+            .await
+            .context("acquire DB connection")?;
+        let event = match database::settlements::get_settlement_without_auction(&mut ex)
+            .await
+            .context("get_settlement_without_auction")?
+        {
+            Some(event) => event,
+            None => return Ok(false),
+        };
+
+        let hash = H256(event.tx_hash.0);
+        tracing::debug!("updating settlement details for tx {hash:?}");
+
+        let Ok(transaction) = self.eth.transaction(hash.into()).await else {
+            tracing::warn!(?hash, "no tx found");
+            return Ok(false);
+        };
+
+        on_settlement_event_action
+            .apply(ex, event, hash, transaction)
+            .await
     }
 }

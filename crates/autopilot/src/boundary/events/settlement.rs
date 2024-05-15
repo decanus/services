@@ -1,5 +1,5 @@
 use {
-    crate::{database::Postgres, on_settlement_event_updater::OnSettlementEventUpdater},
+    crate::{database::Postgres, on_settlement_event::OnSettlementEvent},
     anyhow::Result,
     ethrpc::current_block::RangeInclusive,
     shared::{event_handling::EventStoring, impl_event_retrieving},
@@ -11,11 +11,11 @@ impl_event_retrieving! {
 
 pub struct Indexer {
     db: Postgres,
-    settlement_updater: OnSettlementEventUpdater,
+    settlement_updater: OnSettlementEvent,
 }
 
 impl Indexer {
-    pub fn new(db: Postgres, settlement_updater: OnSettlementEventUpdater) -> Self {
+    pub fn new(db: Postgres, settlement_updater: OnSettlementEvent) -> Self {
         Self {
             db,
             settlement_updater,
@@ -38,7 +38,7 @@ impl EventStoring<contracts::gpv2_settlement::Event> for Indexer {
         let mut transaction = self.db.pool.begin().await?;
         let from_block = *range.start();
         crate::database::events::replace_events(&mut transaction, events, from_block).await?;
-        OnSettlementEventUpdater::delete_observations(&mut transaction, from_block).await?;
+        OnSettlementEvent::delete_observations(&mut transaction, from_block).await?;
         transaction.commit().await?;
 
         self.settlement_updater.schedule_update();

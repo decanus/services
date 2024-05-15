@@ -52,8 +52,7 @@ impl CircuitBreaker {
 
     /// Removes solver from the allow-list in the authenticator contract. This
     /// solver will no longer be able to settle.
-    #[allow(dead_code)]
-    async fn remove_solver(
+    pub async fn remove_solver(
         &self,
         solver: domain::eth::Address,
     ) -> Result<TransactionResult, Error> {
